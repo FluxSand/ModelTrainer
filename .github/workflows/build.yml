@@ -1,45 +1,61 @@
 # This workflow will install Python dependencies, run tests and lint with a single version of Python
 # For more information see: https://docs.github.com/en/actions/automating-builds-and-tests/building-and-testing-python
 
-name: Python application
+name: Train and Release Model
 
 on:
   push:
     branches: [ "main" ]
-  pull_request:
-    branches: [ "main" ]
+  workflow_dispatch:  # 允许手动触发
 
 permissions:
-  contents: read
+  contents: write  # 允许创建 Release
 
 jobs:
-  build:
-
+  train_and_release:
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v4
-    - name: Set up Python 3.10
-      uses: actions/setup-python@v3
+    - name: Checkout ModelTrainer repository
+      uses: actions/checkout@v4
+
+    - name: Clone Dataset repository
+      run: |
+        git clone --depth=1 https://github.com/FluxSand/Dataset.git Dataset
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
       with:
-        python-version: "3.10"
+        python-version: "3.12"
+
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install flake8 pytest
-        if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+        pip install -r requirements.txt
+
     - name: Train the model
       run: |
-          python train.py  # 你的训练脚本
+        python train.py  # 运行训练脚本
 
     - name: Save trained model
       run: |
-          mkdir -p model_output
-          mv model.keras model_output/
-          mv model.onnx model_output/
+        mkdir -p model_output
+        mv model.keras model_output/
+        mv model.onnx model_output/
 
-    - name: Upload trained model
-      uses: actions/upload-artifact@v3
+    - name: Upload trained model as artifact
+      uses: actions/upload-artifact@v4
       with:
-          name: trained-model
-          path: model_output/
+        name: trained-model
+        path: model_output/
+
+    - name: Create a new GitHub Release
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: v1.0.${{ github.run_number }}
+        name: "Release v1.0.${{ github.run_number }}"
+        body: "Automatically generated release with the latest trained model."
+        draft: false
+        prerelease: false
+        files: model_output/*
+
