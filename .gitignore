@@ -1,0 +1,6 @@
+Dataset/**
+.venv/**
+.idea/**
+.history/**
+model.keras
+model.onnx
