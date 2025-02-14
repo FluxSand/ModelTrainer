@@ -40,8 +40,8 @@ jobs:
     - name: Save trained model
       run: |
         mkdir -p model_output
-        mv model.keras model_output/
-        mv model.onnx model_output/
+        mv model_cnn_lstm.keras model_output/
+        mv model_cnn_lstm.onnx model_output/
 
     - name: Upload trained model as artifact
       uses: actions/upload-artifact@v4
