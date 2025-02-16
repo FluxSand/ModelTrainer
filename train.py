@@ -1,131 +1,263 @@
+"""
+Motion Recognition Model with CNN Architecture
+Author: Cong Liu
+Date: 2025-02-16
+Description:
+    This script implements a motion recognition model using a CNN architecture.
+    Features include data preprocessing, augmentation, dual-branch model architecture,
+    and ONNX model export for cross-platform compatibility.
+"""
+
 import os
 import numpy as np
 import pandas as pd
 import tensorflow as tf
 import tf2onnx
 import onnx
+from scipy import stats
+from scipy.interpolate import interp1d
+from imblearn.over_sampling import SMOTE
+from imblearn.under_sampling import RandomUnderSampler
 from sklearn.model_selection import train_test_split
 from tensorflow.keras import layers, models, callbacks, utils, regularizers
 from tensorflow.keras.preprocessing.sequence import pad_sequences
 
 
-# === 1. Configuration Parameters ===
+# === 1. Global Configuration Settings ===
 class Config:
-    SAVE_PATH = './Dataset/'  # Data directory
-    MODEL_NAME = 'model_cnn_lstm.keras'
-    MODEL_ONNX_NAME = 'model_cnn_lstm.onnx'
-    NUM_ROWS = 1500  # Maximum time steps per sample
-    BATCH_SIZE = 80  # Training batch size
-    EPOCHS = 2000  # Maximum training epochs
-    LEARNING_RATE = 0.0005  # Learning rate
-    MOTION_NAMES = [  # Motion categories
+    """Global configuration parameters for model training and data processing"""
+    SAVE_PATH = './Dataset/'  # Path to training data
+    MODEL_NAME = 'model.keras'  # Keras model save filename
+    MODEL_ONNX_NAME = 'model.onnx'  # ONNX model save filename
+    NUM_ROWS = 1500  # Number of timesteps per sample
+    BATCH_SIZE = 300  # Training batch size
+    EPOCHS = 600  # Maximum training epochs
+    LEARNING_RATE = 0.001  # Initial learning rate
+    MOTION_NAMES = [  # Supported motion classes
         'FLIP_OVER', 'LONG_VIBRATION', 'ROTATE_CLOCKWISE', 'ROTATE_COUNTERCLOCKWISE',
         'SHAKE_BACKWARD', 'SHAKE_FORWARD', 'SHORT_VIBRATION', 'TILT_LEFT', 'TILT_RIGHT', 'STILL'
     ]
-    MOTION_LABELS = {name: idx for idx, name in enumerate(MOTION_NAMES)}  # Label encoding mapping
+    MOTION_LABELS = {name: idx for idx, name in enumerate(MOTION_NAMES)}  # Label encoding
 
 
-# === 2. Data Loading ===
-def load_dataset(directory, max_rows=None):
-    """Load IMU sensor CSV dataset
+# === 2. Data Preprocessing Utilities ===
+def handle_missing_values(df: pd.DataFrame) -> pd.DataFrame:
+    """Handle missing values in DataFrame using forward/backward fill"""
+    if df.isnull().sum().sum() > 0:
+        df = df.fillna(method='ffill').fillna(method='bfill')
+    return df
+
+
+def remove_outliers_zscore(data: np.ndarray, threshold: float = 6.5) -> np.ndarray:
+    """Remove outliers using Z-score method"""
+    z_scores = np.abs(stats.zscore(data, axis=0))
+    return data[(z_scores < threshold).all(axis=1)]
+
+
+def add_gaussian_noise(data: np.ndarray, mean: float = 0, std: float = 0.01) -> np.ndarray:
+    """Add Gaussian noise to input data for augmentation"""
+    noise = np.random.normal(mean, std, data.shape)
+    return data + noise
+
+
+def time_warp(data: np.ndarray, sigma: float = 0.8) -> np.ndarray:
+    """
+    Apply time warping augmentation to 2D time-series data (timesteps × features)
+
+    Args:
+        data: Input array of shape (timesteps, features)
+        sigma: Warping intensity parameter
+    """
+    if data.ndim != 2:
+        raise ValueError("Input must be 2D array (timesteps × features)")
+
+    orig_steps = np.arange(data.shape[0])
+    random_offsets = np.random.normal(loc=1.0, scale=sigma, size=(data.shape[0],))
+    new_steps = np.cumsum(random_offsets)
+    new_steps = (new_steps - new_steps.min()) / (new_steps.max() - new_steps.min()) * (data.shape[0] - 1)
+
+    warped_data = np.zeros_like(data)
+    for i in range(data.shape[1]):
+        interpolator = interp1d(orig_steps, data[:, i], kind='linear', fill_value='extrapolate')
+        warped_data[:, i] = interpolator(new_steps)
+    return warped_data
+
+
+def moving_average(data: np.ndarray, window_size: int = 3) -> np.ndarray:
+    """
+    Apply moving average smoothing to 2D time-series data
+
+    Args:
+        data: Input array of shape (timesteps, features)
+        window_size: Size of smoothing window
+    """
+    if data.ndim != 2:
+        raise ValueError("Input must be 2D array (timesteps × features)")
+
+    smoothed = np.zeros_like(data)
+    for i in range(data.shape[1]):
+        smoothed[:, i] = np.convolve(
+            data[:, i],
+            np.ones(window_size) / window_size,
+            mode='same'
+        )
+    return smoothed
+
+
+# === 3. Data Loading and Processing Pipeline ===
+def load_and_preprocess_data(directory: str, max_rows: int, balance_method: str = 'smote'):
+    """
+    Load and preprocess motion sensor data from CSV files
+
     Args:
         directory: Path to data directory
-        max_rows: Maximum rows to read per file
+        max_rows: Number of timesteps per sample
+        balance_method: Data balancing method ('smote' or 'undersampling')
+
     Returns:
-        data_list: Sensor data list [n_samples, time_steps, features]
-        labels: Corresponding label list
+        Processed data splits (x_train, x_test, y_train, y_test)
     """
     data_list, labels = [], []
     expected_columns = ['Pitch', 'Roll', 'Gyro_X', 'Gyro_Y', 'Gyro_Z', 'Accel_X', 'Accel_Y', 'Accel_Z']
 
+    # Load and process each CSV file
     for filename in os.listdir(directory):
         if filename.endswith('.csv'):
-            try:
-                # Parse motion category
-                motion_name = filename.split('_record')[0]
-                if motion_name not in Config.MOTION_LABELS:
-                    continue
+            motion_name = filename.split('_record')[0]
+            if motion_name not in Config.MOTION_LABELS:
+                continue
 
-                # Read CSV file
-                file_path = os.path.join(directory, filename)
-                df = pd.read_csv(file_path)
+            file_path = os.path.join(directory, filename)
+            df = pd.read_csv(file_path)
+            df = handle_missing_values(df)
+            df = remove_outliers_zscore(df)
 
-                # Validate data columns
-                if not set(expected_columns).issubset(df.columns):
-                    print(f"⚠️ File {filename} missing required columns, skipped")
-                    continue
+            if not set(expected_columns).issubset(df.columns):
+                continue
 
-                # Extract and truncate data
-                data = df[expected_columns].values[:max_rows]
-                data_list.append(data)
-                labels.append(Config.MOTION_LABELS[motion_name])
+            data = df[expected_columns].values[:max_rows]
+            data_list.append(data)
+            labels.append(Config.MOTION_LABELS[motion_name])
 
-            except Exception as e:
-                print(f"⛔ Error loading {filename}: {e}")
+    # === Original Class Distribution ===
+    from collections import Counter
+    print("\n=== Original Class Distribution ===")
+    label_counter = Counter(labels)
+    for motion in Config.MOTION_NAMES:
+        count = label_counter.get(Config.MOTION_LABELS[motion], 0)
+        print(f"{motion}: {count} samples")
 
-    return data_list, labels
-
-
-# === 3. Data Preprocessing ===
-def preprocess_data(data_list, labels, max_len):
-    """Data padding and preprocessing
-    Args:
-        data_list: Raw data list
-        labels: Raw label list
-        max_len: Padding length
-    Returns:
-        x_padded: Padded data array [n_samples, max_len, features]
-        y_encoded: One-hot encoded labels
-    """
-    # Sequence padding
+    # Sequence padding and label encoding
     x_padded = pad_sequences(
         data_list,
-        maxlen=max_len,
+        maxlen=max_rows,
         dtype='float32',
         padding='post',
         truncating='post',
         value=0.0
     )
-
-    # Label encoding
     y_encoded = utils.to_categorical(labels, num_classes=len(Config.MOTION_NAMES))
-    return x_padded, y_encoded
+
+    # Train-test split with stratification
+    x_train, x_test, y_train, y_test = train_test_split(
+        x_padded, y_encoded,
+        test_size=0.2,
+        stratify=np.argmax(y_encoded, axis=1),
+        random_state=42
+    )
+
+    # === Training Set Distribution Before Augmentation ===
+    y_train_labels = np.argmax(y_train, axis=1)
+    y_test_labels = np.argmax(y_test, axis=1)
+
+    print("\n=== Training Set Distribution Before Augmentation ===")
+    train_counter = Counter(y_train_labels)
+    for motion in Config.MOTION_NAMES:
+        count = train_counter.get(Config.MOTION_LABELS[motion], 0)
+        print(f"{motion}: {count} samples")
+
+    print("\n=== Test Set Distribution ===")
+    test_counter = Counter(y_test_labels)
+    for motion in Config.MOTION_NAMES:
+        count = test_counter.get(Config.MOTION_LABELS[motion], 0)
+        print(f"{motion}: {count} samples")
+
+    # Apply data augmentation to training set
+    x_train = np.array([add_gaussian_noise(sample) for sample in x_train])
+    x_train = np.array([time_warp(sample) for sample in x_train])
+    x_train = np.array([moving_average(sample) for sample in x_train])
+
+    # Handle class imbalance
+    if balance_method in ['smote', 'undersampling']:
+        x_train_flat = x_train.reshape(len(x_train), -1)
+        sampler = SMOTE(random_state=42) if balance_method == 'smote' else RandomUnderSampler(random_state=42)
+        x_train_flat, y_train = sampler.fit_resample(x_train_flat, np.argmax(y_train, axis=1))
+        x_train = x_train_flat.reshape(-1, x_train.shape[1], x_train.shape[2])
+        y_train = utils.to_categorical(y_train, num_classes=len(Config.MOTION_NAMES))
+
+        # === Training Set After Balancing ===
+        print("\n=== Training Set After Balancing ===")
+        balanced_counter = Counter(np.argmax(y_train, axis=1))
+        for motion in Config.MOTION_NAMES:
+            count = balanced_counter.get(Config.MOTION_LABELS[motion], 0)
+            print(f"{motion}: {count} samples")
+
+    # Standardize data using training statistics
+    mean = np.mean(x_train, axis=(0, 1))
+    std = np.std(x_train, axis=(0, 1)) + 1e-8
+    x_train = (x_train - mean) / std
+    x_test = (x_test - mean) / std
+
+    return x_train, x_test, y_train, y_test
 
 
-# === 4. Data Normalization ===
-def normalize_data(x_train, x_test):
-    """Normalize data using training set statistics"""
-    mean = np.mean(x_train, axis=(0, 1))  # Feature-wise mean
-    std = np.std(x_train, axis=(0, 1)) + 1e-8  # Prevent division by zero
+# === 4. Dual-Branch Model Architecture ===
+class SineActivation(layers.Layer):
+    """Custom sinusoidal activation layer for angle features"""
 
-    x_train_norm = (x_train - mean) / std
-    x_test_norm = (x_test - mean) / std
-    return x_train_norm, x_test_norm
+    def call(self, inputs):
+        return tf.sin(inputs)
 
 
-# === 5. Model Architecture ===
-def build_model(input_shape, num_classes):
-    """Build CNN+BiLSTM model architecture"""
+def build_model(input_shape: tuple, num_classes: int) -> tf.keras.Model:
+    """
+    Build dual-branch CNN model architecture
+
+    Args:
+        input_shape: Input data shape (timesteps, features)
+        num_classes: Number of output classes
+
+    Returns:
+        Compiled Keras model
+    """
     inputs = layers.Input(shape=input_shape)
+    masked = layers.Masking(mask_value=0.0)(inputs)  # Handle padded sequences
 
-    # Masking layer for padding values
-    x = layers.Masking(mask_value=0.0)(inputs)
+    # Feature separation
+    angle_inputs = masked[:, :, :2]  # Pitch and Roll
+    sensor_inputs = masked[:, :, 2:]  # Gyro and Accel
 
-    # CNN feature extraction
-    x = layers.Conv1D(64, kernel_size=5, activation='relu', padding='same')(x)
-    x = layers.Conv1D(128, kernel_size=5, activation='relu', padding='same', dilation_rate=2)(x)
-    x = layers.AveragePooling1D(pool_size=2)(x)
+    # Angle processing branch
+    angle_x = layers.Conv1D(64, 5, padding='same')(angle_inputs)
+    angle_x = SineActivation()(angle_x)
+    angle_x = layers.BatchNormalization()(angle_x)
+    angle_x = layers.Conv1D(128, 5, padding='same', dilation_rate=2)(angle_x)
+    angle_x = SineActivation()(angle_x)
+    angle_x = layers.GlobalAveragePooling1D()(angle_x)
 
-    # BiLSTM temporal modeling
-    x = layers.Bidirectional(layers.LSTM(128, return_sequences=True))(x)
-    x = layers.Bidirectional(layers.LSTM(64))(x)
+    # Sensor processing branch
+    sensor_x = layers.Conv1D(64, 5, padding='same', activation='relu')(sensor_inputs)
+    sensor_x = layers.BatchNormalization()(sensor_x)
+    sensor_x = layers.Conv1D(128, 5, padding='same', dilation_rate=2, activation='relu')(sensor_x)
+    sensor_x = layers.GlobalAveragePooling1D()(sensor_x)
 
-    # Classification layers
-    x = layers.Dense(128, activation='relu', kernel_regularizer=regularizers.l2(0.01))(x)
+    # Feature fusion and classification
+    merged = layers.concatenate([angle_x, sensor_x])
+    x = layers.Dense(128, kernel_regularizer=regularizers.l2(0.01))(merged)
+    x = layers.ReLU()(x)
     x = layers.Dropout(0.5)(x)
     outputs = layers.Dense(num_classes, activation='softmax')(x)
 
-    # Compile model
     model = models.Model(inputs, outputs)
     model.compile(
         optimizer=tf.keras.optimizers.Adam(learning_rate=Config.LEARNING_RATE),
@@ -135,64 +267,55 @@ def build_model(input_shape, num_classes):
     return model
 
 
-# === 6. Model Training ===
-def train_model(x_train, y_train, x_val, y_val):
-    """Model training and validation"""
+# === 5. Model Training and Export ===
+def train_model(x_train: np.ndarray, y_train: np.ndarray,
+                x_val: np.ndarray, y_val: np.ndarray) -> tf.keras.Model:
+    """
+    Train model with early stopping and checkpointing
+
+    Args:
+        x_train: Training data
+        y_train: Training labels
+        x_val: Validation data
+        y_val: Validation labels
+
+    Returns:
+        Trained Keras model
+    """
     model = build_model((Config.NUM_ROWS, 8), len(Config.MOTION_NAMES))
 
-    # Callbacks
     callbacks_list = [
-        callbacks.EarlyStopping(monitor='val_loss', patience=250, restore_best_weights=True),
-        callbacks.ModelCheckpoint(
-            Config.MODEL_NAME,
-            monitor='val_accuracy',
-            save_best_only=True,
-            mode='max'
-        ),
-        callbacks.ReduceLROnPlateau(monitor='val_loss', factor=0.2, patience=100, min_lr=1e-6)
+        callbacks.EarlyStopping(patience=100, restore_best_weights=True),
+        callbacks.ModelCheckpoint(Config.MODEL_NAME, save_best_only=True),
+        callbacks.ReduceLROnPlateau(factor=0.2, patience=50)
     ]
 
-    # Training process
     history = model.fit(
         x_train, y_train,
         validation_data=(x_val, y_val),
         epochs=Config.EPOCHS,
         batch_size=Config.BATCH_SIZE,
         callbacks=callbacks_list,
-        shuffle=True,
         verbose=1
     )
     return model
 
 
-# === Main Program ===
 if __name__ == "__main__":
-    # Data loading and preprocessing
-    data_list, labels = load_dataset(Config.SAVE_PATH, max_rows=Config.NUM_ROWS)
-
-    if len(data_list) < 5:
-        print("⚠️ Dataset too small! Please add more samples.")
-        exit()
-
-    x_padded, y_encoded = preprocess_data(data_list, labels, Config.NUM_ROWS)
-
-    # Stratified data splitting
-    x_train, x_test, y_train, y_test = train_test_split(
-        x_padded, y_encoded,
-        test_size=0.2,
-        stratify=np.argmax(y_encoded, axis=1),
-        random_state=42
+    # Data preparation
+    x_train, x_test, y_train, y_test = load_and_preprocess_data(
+        Config.SAVE_PATH,
+        max_rows=Config.NUM_ROWS,
+        balance_method='smote'
     )
 
-    # Data normalization
-    x_train, x_test = normalize_data(x_train, x_test)
-
     # Model training
-    model = train_model(x_train, y_train, x_test, y_test)
-    model.summary()
+    print("🚀 Starting model training...")
+    trained_model = train_model(x_train, y_train, x_test, y_test)
+    print("✅ Training completed successfully")
 
-    # Export ONNX model
-    input_signature = [tf.TensorSpec(model.inputs[0].shape, model.inputs[0].dtype, name='input')]
-    onnx_model, _ = tf2onnx.convert.from_keras(model, input_signature, opset=13)
+    # Model export
+    input_signature = [tf.TensorSpec(trained_model.inputs[0].shape, trained_model.inputs[0].dtype, name='input')]
+    onnx_model, _ = tf2onnx.convert.from_keras(trained_model, input_signature, opset=13)
     onnx.save(onnx_model, Config.MODEL_ONNX_NAME)
-    print(f"\n✅ ONNX model saved to {Config.MODEL_ONNX_NAME}")
+    print(f"✅ ONNX model saved to {Config.MODEL_ONNX_NAME}")

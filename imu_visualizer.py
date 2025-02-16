@@ -1,11 +1,13 @@
 """
-IMU Data Annotation and Visualization Tool
+IMU Data Annotation and Visualization Tool with Outlier Detection
 
 Features:
 1. Browse and delete CSV data files
 2. 3D pose visualization
 3. Multi-dimensional sensor data visualization
 4. Adjustable playback parameters
+5. Box plot visualization
+6. Z-score based outlier detection and cleaning
 """
 
 import os
@@ -20,6 +22,7 @@ from matplotlib.gridspec import GridSpec
 import matplotlib.animation as animation
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 from scipy.spatial.transform import Rotation as R
+from scipy import stats
 import ttkbootstrap as tb
 from ttkbootstrap.constants import *
 
@@ -28,16 +31,19 @@ CONFIG = {
     "SAVE_PATH": "./Dataset/",
     "EXPECTED_COLUMNS": ['Pitch', 'Roll', 'Gyro_X', 'Gyro_Y', 'Gyro_Z',
                          'Accel_X', 'Accel_Y', 'Accel_Z'],
-    "INITIAL_GEOMETRY": "1600x290+0+0",
+    "INITIAL_GEOMETRY": "1850x700+0+0",
     "PLOT_WINDOW_GEOMETRY": "1920x780+0+300",
     "CUBE_SCALE": 0.5,
     "DEFAULT_SKIP": 20,
-    "DEFAULT_SPEED": 10
+    "DEFAULT_SPEED": 10,
+    "ZSCORE_THRESHOLD": 3,
+    "OUTLIER_COLOR": "red",
+    "CLEANED_SUFFIX": "_cleaned"
 }
 
 
 class IMUVisualizer:
-    """IMU Data Visualization Controller"""
+    """Main controller for IMU data visualization application with outlier handling"""
 
     def __init__(self):
         self.csv_files = []
@@ -45,37 +51,35 @@ class IMUVisualizer:
         self.plot_window = None
         self.ani = None
 
-        # Initialize GUI
+        # Initialize main application window
         self.app = tb.Window(themename="journal")
         self._setup_gui()
         self._refresh_file_list()
 
     def _setup_gui(self):
-        """Build GUI interface"""
+        """Initialize graphical user interface components"""
         self.app.title("IMU Data Annotation Tool")
         self.app.geometry(CONFIG["INITIAL_GEOMETRY"])
 
-        # Main frame
+        # Main container frame
         main_frame = ttk.Frame(self.app, padding=20)
         main_frame.pack(fill=tk.BOTH, expand=True)
 
-        # File list
+        # File listbox configuration
         self.file_listbox = tk.Listbox(main_frame, height=10, width=60)
         self.file_listbox.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 10))
         self.file_listbox.bind("<<ListboxSelect>>", self._on_listbox_select)
 
-        # Control panel
+        # Control panel configuration
         control_frame = ttk.Frame(main_frame)
         control_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
 
-        # Button panel
+        # Create interface components
         self._create_button_panel(control_frame)
-
-        # Slider panel
         self._create_slider_panel(control_frame)
 
     def _create_button_panel(self, parent):
-        """Create button control panel"""
+        """Create button control panel with navigation and actions"""
         button_frame = ttk.Frame(parent)
         button_frame.pack(pady=10)
 
@@ -83,7 +87,9 @@ class IMUVisualizer:
             ("⬅ Prev", self._prev_file, PRIMARY),
             ("Next ➡", self._next_file, PRIMARY),
             ("🗑 Delete", self._delete_file, DANGER),
-            ("📊 Visualize", self._visualize_selected_file, SUCCESS)
+            ("📊 Visualize", self._visualize_selected_file, SUCCESS),
+            ("📦 Box Plot", self._show_boxplot, INFO),
+            ("🧹 Clean Data", self._clean_outliers, WARNING)
         ]
 
         for col, (text, command, style) in enumerate(buttons):
@@ -97,11 +103,11 @@ class IMUVisualizer:
             btn.grid(row=0, column=col, padx=5, pady=5)
 
     def _create_slider_panel(self, parent):
-        """Create slider control panel"""
+        """Create panel with playback control sliders"""
         slider_frame = ttk.Frame(parent)
         slider_frame.pack(pady=20, fill=tk.X)
 
-        # Playback speed control
+        # Playback speed control slider
         self.speed_slider = self._create_slider(
             slider_frame,
             "Playback Speed (ms)",
@@ -110,7 +116,7 @@ class IMUVisualizer:
             self._update_speed_label
         )
 
-        # Frame skip control
+        # Frame skip control slider
         self.skip_slider = self._create_slider(
             slider_frame,
             "Frame Skip Ratio",
@@ -120,7 +126,7 @@ class IMUVisualizer:
         )
 
     def _create_slider(self, parent, label, from_, to, default, callback):
-        """Create generic slider component"""
+        """Generic slider component creation"""
         frame = ttk.Frame(parent)
         frame.pack(fill=tk.X, pady=5)
 
@@ -143,7 +149,7 @@ class IMUVisualizer:
         return slider
 
     def _refresh_file_list(self):
-        """Refresh file list"""
+        """Refresh list of available CSV files"""
         self.csv_files = [
             f for f in os.listdir(CONFIG["SAVE_PATH"])
             if f.endswith('.csv')
@@ -153,13 +159,13 @@ class IMUVisualizer:
             self.file_listbox.insert(tk.END, file)
 
     def _on_listbox_select(self, event):
-        """Handle file list selection event"""
+        """Handle file selection event in listbox"""
         selection = event.widget.curselection()
         if selection:
             self._update_file_selection(selection[0])
 
     def _update_file_selection(self, index):
-        """Update currently selected file"""
+        """Update currently selected file index"""
         if 0 <= index < len(self.csv_files):
             self.current_file_index = index
             self.file_listbox.selection_clear(0, tk.END)
@@ -167,7 +173,7 @@ class IMUVisualizer:
             self.file_listbox.see(index)
 
     def _delete_file(self):
-        """Delete currently selected file"""
+        """Delete currently selected CSV file"""
         if not self.csv_files:
             return
 
@@ -191,7 +197,7 @@ class IMUVisualizer:
             self._close_plot_window()
 
     def _visualize_selected_file(self):
-        """Visualize selected file"""
+        """Launch visualization for selected data file"""
         self._close_plot_window()
 
         if not self.csv_files:
@@ -210,20 +216,20 @@ class IMUVisualizer:
             f"Visualization - {self.csv_files[self.current_file_index]}"
         )
 
-        # Create charts
+        # Initialize visualization components
         fig, (ax3d, ax_pitch, ax_gyro, ax_accel) = self._create_figure()
         cube = self._init_3d_cube(ax3d)
         self._plot_2d_data(ax_pitch, ax_gyro, ax_accel, df)
 
-        # Embed canvas
+        # Embed matplotlib canvas
         canvas = FigureCanvasTkAgg(fig, master=self.plot_window)
         canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
 
-        # Setup animation
+        # Configure animation
         self._setup_animation(canvas, fig, df, cube, ax3d, ax_pitch, ax_gyro, ax_accel)
 
     def _load_and_validate_data(self):
-        """Load and validate data file"""
+        """Load and validate CSV data file"""
         file_path = os.path.join(
             CONFIG["SAVE_PATH"],
             self.csv_files[self.current_file_index]
@@ -245,12 +251,12 @@ class IMUVisualizer:
         return df.iloc[::frame_skip].reset_index(drop=True)
 
     def _create_figure(self):
-        """Create chart layout"""
+        """Create matplotlib figure layout"""
         fig = plt.figure(figsize=(14, 10))
         gs = GridSpec(2, 2, figure=fig,
                       width_ratios=[1, 1],
                       height_ratios=[1, 1],
-                      wspace=0.3, hspace=0.4)
+                      wspace=0.1, hspace=0.2)
 
         ax3d = fig.add_subplot(gs[0, 0], projection='3d')
         ax_pitch = fig.add_subplot(gs[0, 1])
@@ -260,7 +266,7 @@ class IMUVisualizer:
         return fig, (ax3d, ax_pitch, ax_gyro, ax_accel)
 
     def _init_3d_cube(self, ax):
-        """Initialize 3D cube"""
+        """Initialize 3D cube visualization"""
         cube_faces = self._create_cube()
         cube = Poly3DCollection(cube_faces, alpha=0.5, edgecolor='k')
         ax.add_collection3d(cube)
@@ -275,48 +281,60 @@ class IMUVisualizer:
         return cube_faces
 
     def _plot_2d_data(self, ax_pitch, ax_gyro, ax_accel, df):
-        """Plot 2D sensor data"""
+        """Plot 2D sensor data charts with outlier highlighting"""
         time_steps = np.arange(len(df))
 
-        # Orientation data
+        # Calculate outliers
+        z_scores = np.abs(stats.zscore(df[CONFIG["EXPECTED_COLUMNS"]]))
+        outliers = (z_scores > CONFIG["ZSCORE_THRESHOLD"]).any(axis=1)
+
+        # Orientation plot
         ax_pitch.plot(time_steps, df['Pitch'].fillna(0), 'r', label='Pitch')
         ax_pitch.plot(time_steps, df['Roll'].fillna(0), 'g', label='Roll')
+        ax_pitch.scatter(time_steps[outliers], df['Pitch'][outliers],
+                         color=CONFIG["OUTLIER_COLOR"], zorder=3)
+        ax_pitch.scatter(time_steps[outliers], df['Roll'][outliers],
+                         color=CONFIG["OUTLIER_COLOR"], zorder=3)
         ax_pitch.set_title("Orientation Data")
         ax_pitch.legend()
         ax_pitch.grid(True)
 
-        # Gyroscope data
+        # Gyroscope plot
         for col, color in zip(['Gyro_X', 'Gyro_Y', 'Gyro_Z'], ['b', 'g', 'r']):
             ax_gyro.plot(time_steps, df[col], color, label=col)
+            ax_gyro.scatter(time_steps[outliers], df[col][outliers],
+                            color=CONFIG["OUTLIER_COLOR"], zorder=3)
         ax_gyro.set_title("Gyroscope")
         ax_gyro.legend()
         ax_gyro.grid(True)
 
-        # Accelerometer data
+        # Accelerometer plot
         for col, color in zip(['Accel_X', 'Accel_Y', 'Accel_Z'], ['b', 'g', 'r']):
             ax_accel.plot(time_steps, df[col], color, label=col)
+            ax_accel.scatter(time_steps[outliers], df[col][outliers],
+                             color=CONFIG["OUTLIER_COLOR"], zorder=3)
         ax_accel.set_title("Accelerometer")
         ax_accel.legend()
         ax_accel.grid(True)
 
     def _setup_animation(self, canvas, fig, df, cube_faces, ax3d, ax_pitch, ax_gyro, ax_accel):
-        """Configure animation parameters"""
+        """Configure animation parameters and callbacks"""
         pitch = df['Pitch'].fillna(0)
         roll = df['Roll'].fillna(0)
         play_speed = int(self.speed_slider.get())
 
         def update_frame(i):
-            """Animation frame update function"""
+            """Animation frame update callback"""
             if i >= len(df):
                 return
 
-            # Update 3D cube
+            # Update 3D cube rotation
             rot = R.from_euler('yx', [pitch[i], roll[i]]).as_matrix()
             rotated = [[rot @ vertex for vertex in face] for face in cube_faces]
             ax3d.collections[0].set_verts(rotated)
             ax3d.set_title(f"Frame {i + 1}/{len(df)}")
 
-            # Update cursor positions
+            # Update vertical cursors in 2D plots
             for ax in [ax_pitch, ax_gyro, ax_accel]:
                 for line in ax.lines:
                     if line.get_label() == '_cursor':
@@ -325,7 +343,7 @@ class IMUVisualizer:
 
             canvas.draw_idle()
 
-        # Create animation
+        # Initialize animation
         self.ani = animation.FuncAnimation(
             fig,
             update_frame,
@@ -345,7 +363,7 @@ class IMUVisualizer:
         self._adjust_window_geometry()
 
     def _adjust_window_geometry(self):
-        """Adjust window geometry"""
+        """Adjust visualization window geometry"""
 
         def force_redraw():
             self.plot_window.update_idletasks()
@@ -355,9 +373,99 @@ class IMUVisualizer:
         self.plot_window.geometry("0x0+0+0")
         self.plot_window.after(100, force_redraw)
 
+    def _show_boxplot(self):
+        """Display boxplot for outlier detection using Tkinter canvas"""
+        if not self.csv_files:
+            messagebox.showwarning("No Data", "No CSV files available!")
+            return
+
+        try:
+            df = self._load_and_validate_data()
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
+            return
+
+        # Create new window
+        boxplot_window = tk.Toplevel(self.app)
+        boxplot_window.title("Box Plot Analysis")
+
+        # Create figure
+        fig = plt.Figure(figsize=(10, 8))
+        axes = fig.subplots(3, 1)
+
+        features = ['Gyro_X', 'Gyro_Y', 'Gyro_Z',
+                    'Accel_X', 'Accel_Y', 'Accel_Z']
+
+        # Create boxplots
+        for i, col in enumerate(features):
+            ax = axes[i // 2]
+            ax.boxplot(df[col], positions=[i % 2],
+                       widths=0.6, patch_artist=True)
+            ax.set_title(f'Box Plot - {col.split("_")[0]}')
+            ax.set_xticks([0, 1])
+            ax.set_xticklabels(features[i // 2 * 2:i // 2 * 2 + 2])
+
+        fig.tight_layout()
+
+        # Embed in Tkinter
+        canvas = FigureCanvasTkAgg(fig, master=boxplot_window)
+        canvas.draw()
+        canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+        # Add close button
+        ttk.Button(
+            boxplot_window,
+            text="Close",
+            command=boxplot_window.destroy
+        ).pack(pady=10)
+
+    def _clean_outliers(self):
+        """Clean data using Z-score outlier detection"""
+        if not self.csv_files:
+            messagebox.showwarning("No Data", "No CSV files available!")
+            return
+
+        try:
+            df = self._load_and_validate_data()
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
+            return
+
+        # Calculate Z-scores
+        z_scores = np.abs(stats.zscore(df[CONFIG["EXPECTED_COLUMNS"]]))
+        outlier_mask = (z_scores > CONFIG["ZSCORE_THRESHOLD"]).any(axis=1)
+
+        # Create cleaned dataframe
+        cleaned_df = df[~outlier_mask].copy()
+        original_count = len(df)
+        cleaned_count = len(cleaned_df)
+        removed_count = original_count - cleaned_count
+
+        # Show confirmation dialog
+        confirm = messagebox.askyesno(
+            "Confirm Cleaning",
+            f"Found {removed_count} outliers ({removed_count / original_count:.1%})\n"
+            f"Save cleaned data?",
+            parent=self.app
+        )
+
+        if confirm:
+            # Save cleaned data
+            original_path = os.path.join(
+                CONFIG["SAVE_PATH"],
+                self.csv_files[self.current_file_index]
+            )
+            new_filename = os.path.splitext(self.csv_files[self.current_file_index])[0] + \
+                           CONFIG["CLEANED_SUFFIX"] + ".csv"
+            new_path = os.path.join(CONFIG["SAVE_PATH"], new_filename)
+            cleaned_df.to_csv(new_path, index=False)
+            messagebox.showinfo("Success",
+                                f"Saved cleaned data to {new_filename}")
+            self._refresh_file_list()
+
     @staticmethod
     def _create_cube():
-        """Create cube vertices"""
+        """Generate cube vertices for 3D visualization"""
         scale = CONFIG["CUBE_SCALE"]
         vertices = np.array([
             [-scale, -scale, -scale],
@@ -379,7 +487,7 @@ class IMUVisualizer:
         ]
 
     def _close_plot_window(self):
-        """Close visualization window"""
+        """Close visualization window and cleanup resources"""
         if self.plot_window and self.plot_window and self.plot_window.destroy:
             self.plot_window.destroy()
             self.plot_window = None
@@ -388,33 +496,33 @@ class IMUVisualizer:
             self.ani = None
 
     def _prev_file(self):
-        """Select previous file"""
+        """Navigate to previous file in list"""
         if self.current_file_index > 0:
             self._close_plot_window()
             self._update_file_selection(self.current_file_index - 1)
             self._visualize_selected_file()
 
     def _next_file(self):
-        """Select next file"""
+        """Navigate to next file in list"""
         if self.current_file_index < len(self.csv_files) - 1:
             self._close_plot_window()
             self._update_file_selection(self.current_file_index + 1)
             self._visualize_selected_file()
 
     def _update_speed_label(self, value):
-        """Update speed label"""
+        """Update playback speed label text"""
         self.speed_slider.master.children['!label'].config(
             text=f"Speed: {int(float(value))} ms"
         )
 
     def _update_skip_label(self, value):
-        """Update skip frame label"""
+        """Update frame skip label text"""
         self.skip_slider.master.children['!label'].config(
             text=f"Skip: {int(float(value))}"
         )
 
     def run(self):
-        """Run main application"""
+        """Start main application loop"""
         self.app.mainloop()
 
 

@@ -2,5 +2,5 @@ Dataset/**
 .venv/**
 .idea/**
 .history/**
-model.keras
-model.onnx
+*.keras
+*.onnx
