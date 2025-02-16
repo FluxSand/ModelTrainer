@@ -7,18 +7,17 @@ Tools for IMU sensor data processing and visualization
 ```bash
 git clone --depth=1 https://github.com/FluxSand/Dataset.git Dataset
 python train.py
-# cp model_cnn_lstm.onnx XXX
+# cp model.onnx XXX
 ```
 
 ## 📦 Files
 
-### 1. CNN-LSTM Motion Classifier (`model_cnn_lstm.py`)
+### 1. CNN Motion Classifier (`train.py`)
 
 **Features**:
 
-- Hybrid CNN-BiLSTM architecture for temporal pattern recognition
 - Advanced data preprocessing pipeline
-  - Sequence padding & normalizationiles
+  - Sequence padding & normalization
   - Stratified dataset splitting
 - ONNX model export capability
 - Embedded early stopping & learning rate scheduling
@@ -33,19 +32,25 @@ python train.py
 - Multi-view sensor visualization
   - 3D pose animation with adjustable parameters
   - Synchronized 2D plots (Pitch/Roll/Gyro/Accel)
+  - Enhanced real-time data updates
 - Customizable playback controls
   - Frame skip ratio (1-50)
   - Speed adjustment (10-200ms)
+  - Interactive zoom and rotation
 
 **Requirements**:
 
 ```text
-tensorflow==2.10.0
-pandas==1.5.0
-matplotlib==3.6.0
-scipy==1.9.0
-ttkbootstrap==1.10.1
-tf2onnx==1.13.0
+numpy~=2.0.2
+pandas~=2.2.3
+tensorflow~=2.18.0
+tf2onnx~=1.16.1
+onnx~=1.17.0
+scipy~=1.15.1
+imblearn~=0.0
+scikit-learn~=1.6.1
+matplotlib~=3.10.0
+ttkbootstrap~=1.10.1
 ```
 
 ## 📂 Dataset Structure
