@@ -212,11 +212,20 @@ def load_and_preprocess_data(directory: str, max_rows: int, balance_method: str 
 
 
 # === 4. Dual-Branch Model Architecture ===
-class SineActivation(layers.Layer):
-    """Custom sinusoidal activation layer for angle features"""
+class AngleFeatureEncoder(layers.Layer):
+    """Custom layer for encoding angle features with periodic activation"""
 
     def call(self, inputs):
-        return tf.sin(inputs)
+        """
+        Apply sinusoidal transformation to angle features
+
+        Args:
+            inputs: Tensor containing angle features (Pitch and Roll)
+
+        Returns:
+            Tensor concatenating sin and cos transformations of inputs
+        """
+        return tf.concat([tf.sin(inputs), tf.cos(inputs)], axis=-1)
 
 
 def build_model(input_shape: tuple, num_classes: int) -> tf.keras.Model:
@@ -237,12 +246,12 @@ def build_model(input_shape: tuple, num_classes: int) -> tf.keras.Model:
     angle_inputs = masked[:, :, :2]  # Pitch and Roll
     sensor_inputs = masked[:, :, 2:]  # Gyro and Accel
 
-    # Angle processing branch
+    # Enhanced angle processing branch
     angle_x = layers.Conv1D(64, 5, padding='same')(angle_inputs)
-    angle_x = SineActivation()(angle_x)
+    angle_x = AngleFeatureEncoder()(angle_x)  # Now outputs 128 features (sin+cos)
     angle_x = layers.BatchNormalization()(angle_x)
     angle_x = layers.Conv1D(128, 5, padding='same', dilation_rate=2)(angle_x)
-    angle_x = SineActivation()(angle_x)
+    angle_x = AngleFeatureEncoder()(angle_x)  # Apply periodic activation again
     angle_x = layers.GlobalAveragePooling1D()(angle_x)
 
     # Sensor processing branch
